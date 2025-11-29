@@ -171,3 +171,5 @@ Expose the agent via a FastAPI or Flask endpoint.
 <img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/7316f517-2256-4450-8411-b6a2a634f28a" />
 
 DEMO VIDEO
+https://github.com/user-attachments/assets/b7395829-27df-4c2a-87e4-2e8073b1b2c1
+
