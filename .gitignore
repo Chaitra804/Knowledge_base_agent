@@ -1,0 +1,26 @@
+# Environment files
+.env
+
+# Chroma vector DB
+chroma_db/
+persist/
+index/
+
+# Temp files
+temp/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Streamlit secrets (local only)
+.streamlit/secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db
