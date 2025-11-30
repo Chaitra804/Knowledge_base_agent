@@ -4,6 +4,7 @@ faiss-cpu
 chromadb
 langchain
 langchain-community
+scikit-learn
 langchain-text-splitters
 pypdf
 python-dotenv
