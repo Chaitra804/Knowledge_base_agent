@@ -35,7 +35,18 @@ except Exception:
         CHROMA_IMPORT = None
 
 # Embeddings base
-from langchain.embeddings.base import Embeddings
+# Embeddings base — try to import from langchain, else provide a minimal fallback
+try:
+    from langchain.embeddings.base import Embeddings
+except Exception:
+    # Minimal fallback base class so the custom GeminiEmbeddings can subclass it
+    class Embeddings:
+        def embed_documents(self, texts):
+            raise NotImplementedError("embed_documents must be implemented by subclass")
+
+        def embed_query(self, text):
+            raise NotImplementedError("embed_query must be implemented by subclass")
+
 
 # TF-IDF fallback
 from sklearn.feature_extraction.text import TfidfVectorizer
