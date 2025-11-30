@@ -6,4 +6,14 @@ langchain-community
 langchain-chroma
 chromadb>=0.4.0
 scikit-learn
+pstreamlit>=1.20
+python-dotenv
+google-generativeai
+langchain
+langchain-text-splitters
+langchain-community
+langchain-chroma
+chromadb>=0.4.0
+scikit-learn
 pypdf
+ypdf
