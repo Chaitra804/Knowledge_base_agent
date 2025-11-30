@@ -1,4 +1,12 @@
 # streamlit_app.py
+"""
+Gemini Knowledge Base Agent - patched file
+- Uses langchain_chroma.Chroma if available (recommended)
+- Writes Chroma persistence to a writable temp dir to avoid read-only DB errors
+- Falls back to TF-IDF retriever if Chroma or embeddings fail
+- Guards vectordb.persist() calls (newer Chroma auto-persists)
+"""
+
 import os
 import tempfile
 import shutil
@@ -12,7 +20,21 @@ import google.generativeai as genai
 # LangChain components (community packages)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.vectorstores import Chroma
+
+# Prefer the new langchain_chroma package if installed; otherwise fall back.
+try:
+    from langchain_chroma import Chroma
+    CHROMA_IMPORT = "langchain_chroma"
+except Exception:
+    # fallback to older import (may be deprecated)
+    try:
+        from langchain_community.vectorstores import Chroma
+        CHROMA_IMPORT = "langchain_community.vectorstores"
+    except Exception:
+        Chroma = None
+        CHROMA_IMPORT = None
+
+# Embeddings base
 from langchain.embeddings.base import Embeddings
 
 # TF-IDF fallback
@@ -34,16 +56,13 @@ genai.configure(api_key=GEMINI_API_KEY)
 # -------------------------------
 # Streamlit UI Setup
 # -------------------------------
-st.set_page_config(
-    page_title="Gemini Knowledge Base Agent",
-    layout="wide",
-    page_icon="📚"
-)
-st.title("📚 Gemini Knowledge Base Agent (Robust RAG + TF-IDF Fallback)")
+st.set_page_config(page_title="Gemini Knowledge Base Agent", layout="wide", page_icon="📚")
+st.title("📚 Gemini Knowledge Base Agent (Patched: langchain-chroma + safe persist)")
 st.markdown(
     "Upload PDFs or TXT files and ask questions based on their content. "
-    "Hybrid Mode will let Gemini answer from general knowledge if the document lacks the answer."
+    "This version prefers `langchain_chroma` for Chroma and writes persistence to a writable temp directory to avoid read-only DB errors."
 )
+st.caption(f"Chroma import used: {CHROMA_IMPORT}")
 
 # -------------------------------
 # Session state initialization
@@ -78,12 +97,11 @@ uploaded_files = st.file_uploader("Upload PDF or TXT files", type=["pdf", "txt"]
 # Gemini Embeddings wrapper
 # -------------------------------
 class GeminiEmbeddings(Embeddings):
-    """Wrapper for Gemini embeddings with LangChain interface."""
+    """Wrapper for Gemini embeddings with LangChain-like interface."""
     def embed_documents(self, texts):
         embeddings = []
         for t in texts:
             r = genai.embed_content(model="models/text-embedding-004", content=t)
-            # robust extraction
             if isinstance(r, dict):
                 emb = r.get("embedding")
             else:
@@ -101,12 +119,10 @@ class GeminiEmbeddings(Embeddings):
 # TF-IDF fallback retriever
 # -------------------------------
 class TfidfRetriever:
-    """A simple TF-IDF retriever that mimics LangChain retriever interface (get_relevant_documents)."""
+    """Simple TF-IDF retriever with LangChain-like interface."""
     def __init__(self, docs):
-        # docs: list[str]
-        self.docs = docs
-        # handle empty docs gracefully
         safe_docs = [d if d and isinstance(d, str) else "" for d in docs]
+        self.docs = safe_docs
         self.vectorizer = TfidfVectorizer().fit(safe_docs)
         self.doc_vectors = self.vectorizer.transform(safe_docs)
 
@@ -118,14 +134,12 @@ class TfidfRetriever:
         idx = np.argsort(scores)[::-1][:k]
         results = []
         for i in idx:
-            class D:
-                pass
+            class D: pass
             d = D()
             d.page_content = self.docs[i]
             results.append(d)
         return results
 
-    # compatibility aliases
     def similarity_search(self, query, k=4):
         return self.get_relevant_documents(query, k=k)
 
@@ -150,11 +164,9 @@ def load_and_split_documents(file_paths, chunk_size=1000, chunk_overlap=50):
 
 def create_vectorstore(chunks, persist_dir="chroma_db", collection_name="gemini_collection", k=4):
     """
-    Build Chroma vectorstore from document chunks using Gemini embeddings.
-    On failure, fall back to TF-IDF retriever to keep app usable.
-    Returns either:
-      - (vectordb, retriever) when Chroma succeeded
-      - retriever (TfidfRetriever) when fallback is used
+    Build Chroma vectorstore using a writable temp directory for persistence (to avoid readonly db).
+    Falls back to TF-IDF retriever if anything fails.
+    Returns either (vectordb, retriever) or a retriever instance (fallback).
     """
     embed = GeminiEmbeddings()
     documents = [chunk.page_content for chunk in chunks]
@@ -163,7 +175,7 @@ def create_vectorstore(chunks, persist_dir="chroma_db", collection_name="gemini_
         st.error("No documents found to index.")
         return None
 
-    # Validate embeddings with a test call
+    # Quick embedding validation
     try:
         test_emb = embed.embed_documents([documents[0]])
         if not test_emb or not isinstance(test_emb[0], (list, tuple)):
@@ -176,92 +188,102 @@ def create_vectorstore(chunks, persist_dir="chroma_db", collection_name="gemini_
         st.warning("Embedding generation failed — falling back to TF-IDF retriever.")
         return TfidfRetriever(documents)
 
-    # Attempt to build Chroma DB
+    # Create a writable temporary directory for Chroma persistence
+    session_temp = None
+    writable_persist_dir = None
     try:
-        # Remove existing persisted db if present
-        if os.path.exists(persist_dir):
-            try:
-                old = Chroma(persist_directory=persist_dir, collection_name=collection_name)
-                try:
-                    old._client.close()
-                except Exception:
-                    pass
-                shutil.rmtree(persist_dir)
-            except Exception:
-                st.warning("Could not remove existing chroma_db folder; continuing.")
+        session_temp = tempfile.mkdtemp(prefix="chroma_")
+        writable_persist_dir = os.path.join(session_temp, persist_dir)
+        os.makedirs(writable_persist_dir, exist_ok=True)
+    except Exception:
+        writable_persist_dir = None
 
-        vectordb = Chroma.from_texts(
-            texts=documents,
-            embedding=embed,
-            persist_directory=persist_dir,
-            collection_name=collection_name
-        )
+    # Try to create Chroma vectorstore
+    try:
+        if Chroma is None:
+            st.warning("Chroma package not available; falling back to TF-IDF retriever.")
+            return TfidfRetriever(documents)
+
+        if writable_persist_dir:
+            st.info(f"Using writable persist directory: {writable_persist_dir}")
+            vectordb = Chroma.from_texts(
+                texts=documents,
+                embedding=embed,
+                persist_directory=writable_persist_dir,
+                collection_name=collection_name
+            )
+        else:
+            st.info("Using in-memory Chroma (no persist_directory).")
+            # Many Chroma versions accept no persist_directory for in-memory usage
+            vectordb = Chroma.from_texts(
+                texts=documents,
+                embedding=embed,
+                collection_name=collection_name
+            )
+
+        # Try to persist only if method exists; guard it
         try:
-            vectordb.persist()
+            if hasattr(vectordb, "persist"):
+                try:
+                    vectordb.persist()
+                except Exception:
+                    # ignore persistence errors; environment may be ephemeral
+                    st.info("Chroma.persist() failed or not supported in this environment; continuing with in-memory index.")
         except Exception:
-            st.info("Chroma persist not supported or failed in this environment.")
+            pass
 
+        # Return retriever
         try:
             retriever = vectordb.as_retriever(search_kwargs={"k": k})
             return vectordb, retriever
         except Exception:
-            # fallback to returning vectordb itself (many APIs support similarity_search)
             return vectordb, vectordb
-    except Exception as e:
-        # Capture full traceback to help debugging (but avoid leaking secrets)
+
+    except Exception:
+        # Capture traceback for debugging
         tb = traceback.format_exc()
-        st.error("ChromaDB upsert failed. Falling back to TF-IDF retriever.")
-        # Show only a limited portion of the traceback in UI for safety
+        st.error("ChromaDB creation/upsert failed — falling back to TF-IDF retriever.")
+        # Show truncated traceback in UI to help debug (avoid printing secrets)
         st.code("\n".join(tb.splitlines()[:300]))
+        # Cleanup temp dir if it exists
+        try:
+            if session_temp and os.path.exists(session_temp):
+                shutil.rmtree(session_temp)
+        except Exception:
+            pass
         return TfidfRetriever(documents)
 
 def robust_retrieve(retriever_obj, vectordb_obj, query, k=4):
     """
     Try multiple retrieval APIs in order. Return list of Document-like objects.
-    Accepts:
-      - retriever_obj: object with get_relevant_documents / retrieve / similarity_search
-      - vectordb_obj: vectordb instance (optional)
     """
     results = []
-    # 1. get_relevant_documents
     try:
         if retriever_obj and hasattr(retriever_obj, "get_relevant_documents"):
-            results = retriever_obj.get_relevant_documents(query)
-            return results
+            return retriever_obj.get_relevant_documents(query)
     except Exception:
         pass
-
-    # 2. retrieve()
     try:
         if retriever_obj and hasattr(retriever_obj, "retrieve"):
-            results = retriever_obj.retrieve(query)
-            return results
+            return retriever_obj.retrieve(query)
     except Exception:
         pass
-
-    # 3. similarity_search on retriever
     try:
         if retriever_obj and hasattr(retriever_obj, "similarity_search"):
-            results = retriever_obj.similarity_search(query, k=k)
-            return results
+            return retriever_obj.similarity_search(query, k=k)
     except Exception:
         pass
-
-    # 4. vectordb similarity_search
     try:
         if vectordb_obj and hasattr(vectordb_obj, "similarity_search"):
-            results = vectordb_obj.similarity_search(query, k=k)
-            return results
+            return vectordb_obj.similarity_search(query, k=k)
     except Exception:
         pass
-
-    # nothing found
     return results
 
 def generate_answer_with_gemini(model_name, prompt):
+    """Call Gemini and extract a readable answer robustly."""
     model = genai.GenerativeModel(model_name)
     resp = model.generate_content(prompt)
-    # Robustly extract answer
     answer = None
     try:
         if hasattr(resp, "text") and resp.text:
@@ -303,17 +325,17 @@ if uploaded_files:
         st.success(f"✅ Created {len(chunks)} chunks.")
         st.session_state.chunks = chunks
 
-    # Show chunk previews for debugging
+    # Show chunk previews if requested
     if show_debug:
         st.subheader("Debug — sample chunk previews (first 6)")
         for i, c in enumerate(chunks[:6]):
             st.markdown(f"**Chunk {i+1} (length {len(c.page_content)}):**")
             st.code(c.page_content[:1200])
 
-    # Create vectorstore (Chroma) with fallback
+    # Build vectorstore (Chroma) with safe temp-dir persistence and fallback
     with st.spinner("Building vector store (Chroma) — this may take a moment..."):
         res = create_vectorstore(chunks, persist_dir="chroma_db", collection_name="gemini_collection", k=top_k)
-        # res may be (vectordb, retriever) or retriever fallback
+
         if isinstance(res, tuple) and len(res) == 2:
             vectordb, retriever = res
             st.session_state.vectordb = vectordb
@@ -345,7 +367,7 @@ if uploaded_files:
         with st.spinner("Retrieving relevant document chunks..."):
             results = robust_retrieve(st.session_state.retriever, st.session_state.vectordb, query, k=top_k)
 
-            # Try alternate expanded query if nothing returned
+            # If nothing returned, try an alternate expanded query
             if not results:
                 st.warning("No relevant chunks found with the default query.")
                 alt_query = query if len(query) > 4 else f"{query} definition"
